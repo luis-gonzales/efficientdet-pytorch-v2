@@ -22,6 +22,7 @@ from datetime import datetime
 import torch
 import torchvision.utils
 from torch.nn.parallel import DistributedDataParallel as NativeDDP
+import wandb
 try:
     from apex import amp
     from apex.parallel import DistributedDataParallel as ApexDDP
@@ -137,7 +138,7 @@ parser.add_argument('--warmup-lr', type=float, default=0.0001, metavar='LR',
                     help='warmup learning rate (default: 0.0001)')
 parser.add_argument('--min-lr', type=float, default=1e-5, metavar='LR',
                     help='lower lr bound for cyclic schedulers that hit 0 (1e-5)')
-parser.add_argument('--epochs', type=int, default=300, metavar='N',
+parser.add_argument('--epochs', type=int, default=250, metavar='N',
                     help='number of epochs to train (default: 2)')
 parser.add_argument('--start-epoch', default=None, type=int, metavar='N',
                     help='manual epoch number (useful on restarts)')
@@ -216,6 +217,9 @@ parser.add_argument('--eval-metric', default='map', type=str, metavar='EVAL_METR
                     help='Best metric (default: "map"')
 parser.add_argument('--tta', type=int, default=0, metavar='N',
                     help='Test/inference time augmentation (oversampling) factor. 0=None (default: 0)')
+
+# wandb
+parser.add_argument('--project', help='project name to use for wandb')
 
 
 def _parse_args():
@@ -305,6 +309,10 @@ def main():
     model_config = model.config  # grab before we obscure with DP/DDP wrappers
 
     if args.local_rank == 0:
+        if not args.project:
+            logging.info('no --project option specified; will not use wandb')
+        else:
+            wandb.init(project=args.project, config=args, resume='allow')
         logging.info('Model %s created, param count: %d' % (args.model, sum([m.numel() for m in model.parameters()])))
 
     model.cuda()
@@ -466,6 +474,13 @@ def main():
             else:
                 eval_metrics = validate(model, loader_eval, args, evaluator)
 
+            # log metrics to wandb
+            if args.local_rank == 0 and args.project:
+                metricd = OrderedDict(epoch=epoch)
+                metricd.update([('train_' + k, v) for k, v in train_metrics.items()])
+                metricd.update([('eval_' + k, v) for k, v in eval_metrics.items()])
+                wandb.log(metricd)
+
             if lr_scheduler is not None:
                 # step LR for next epoch
                 lr_scheduler.step(epoch + 1, eval_metrics[eval_metric])
@@ -487,6 +502,8 @@ def main():
     if best_metric is not None:
         logging.info('*** Best metric: {0} (epoch {1})'.format(best_metric, best_epoch))
 
+    if args.local_rank == 0 and args.project:
+        wandb.finish()
 
 def create_datasets_and_loaders(
         args,
@@ -584,6 +601,8 @@ def train_epoch(
     batch_time_m = utils.AverageMeter()
     data_time_m = utils.AverageMeter()
     losses_m = utils.AverageMeter()
+    cls_losses_m = utils.AverageMeter()
+    box_losses_m = utils.AverageMeter()
 
     model.train()
     clip_params = get_clip_parameters(model, exclude_head='agc' in args.clip_mode)
@@ -600,9 +619,13 @@ def train_epoch(
         with amp_autocast():
             output = model(input, target)
         loss = output['loss']
+        cls_loss = output['class_loss']
+        box_loss = output['box_loss']
 
         if not args.distributed:
             losses_m.update(loss.item(), input.size(0))
+            cls_losses_m.update(cls_loss.item(), input.size(0))
+            box_losses_m.update(box_lossitem(), input.size(0))
 
         optimizer.zero_grad()
         if loss_scaler is not None:
@@ -632,6 +655,10 @@ def train_epoch(
             if args.distributed:
                 reduced_loss = utils.reduce_tensor(loss.data, args.world_size)
                 losses_m.update(reduced_loss.item(), input.size(0))
+                reduced_box_loss = utils.reduce_tensor(box_loss.data, args.world_size)
+                box_losses_m.update(reduced_box_loss.item(), input.size(0))
+                reduced_cls_loss = utils.reduce_tensor(cls_loss.data, args.world_size)
+                cls_losses_m.update(reduced_cls_loss.item(), input.size(0))
 
             if args.local_rank == 0:
                 global_batch_size = input.size(0) * args.world_size
@@ -665,12 +692,14 @@ def train_epoch(
     if hasattr(optimizer, 'sync_lookahead'):
         optimizer.sync_lookahead()
 
-    return OrderedDict([('loss', losses_m.avg)])
+    return OrderedDict([('loss', losses_m.avg), ('box_loss', box_losses_m.avg), ('cls_loss', cls_losses_m.avg)])
 
 
 def validate(model, loader, args, evaluator=None, log_suffix=''):
     batch_time_m = utils.AverageMeter()
     losses_m = utils.AverageMeter()
+    cls_losses_m = utils.AverageMeter()
+    box_losses_m = utils.AverageMeter()
 
     model.eval()
 
@@ -682,18 +711,26 @@ def validate(model, loader, args, evaluator=None, log_suffix=''):
 
             output = model(input, target)
             loss = output['loss']
+            cls_loss = output['class_loss']
+            box_loss = output['box_loss']
 
             if evaluator is not None:
                 evaluator.add_predictions(output['detections'], target)
 
             if args.distributed:
                 reduced_loss = utils.reduce_tensor(loss.data, args.world_size)
+                reduced_box_loss = utils.reduce_tensor(box_loss.data, args.world_size)
+                reduced_cls_loss = utils.reduce_tensor(cls_loss.data, args.world_size)
             else:
                 reduced_loss = loss.data
+                reduced_box_loss = box_loss.data
+                reduced_cls_loss = cls_loss.data
 
             torch.cuda.synchronize()
 
             losses_m.update(reduced_loss.item(), input.size(0))
+            cls_losses_m.update(reduced_cls_loss.item(), input.size(0))
+            box_losses_m.update(reduced_box_loss.item(), input.size(0))
 
             batch_time_m.update(time.time() - end)
             end = time.time()
@@ -705,7 +742,7 @@ def validate(model, loader, args, evaluator=None, log_suffix=''):
                     f'Loss: {losses_m.val:>7.4f} ({losses_m.avg:>6.4f}) '
                 )
 
-    metrics = OrderedDict([('loss', losses_m.avg)])
+    metrics = OrderedDict([('loss', losses_m.avg), ('box_loss', box_losses_m.avg), ('cls_loss', cls_losses_m.avg)])
     if evaluator is not None:
         metrics['map'] = evaluator.evaluate()
 
