@@ -127,6 +127,8 @@ def smooth_l1_loss(
 
 
 def _iou(decoded_output, decoded_target):
+    eps = 1e-7
+
     # area of gt
     Ag = (decoded_target[:, 3] - decoded_target[:, 1]) * (decoded_target[:, 2] - decoded_target[:, 0])
 
@@ -145,7 +147,7 @@ def _iou(decoded_output, decoded_target):
     # union
     U = Ap + Ag - I
 
-    return I/U, U
+    return I/(U + eps), U
 
 
 def _box_loss(outputs, targets, anchors, num_positives, loss_type: str):
@@ -154,6 +156,7 @@ def _box_loss(outputs, targets, anchors, num_positives, loss_type: str):
     # for instances, the regression targets of 512x512 input with 6 anchors on
     # P3-P7 pyramid is about [0.1, 0.1, 0.2, 0.2].
 
+    eps = 1e-7
     loss = []
     anchors = anchors.to(targets.device)
     for output, target in zip(outputs, targets): # per sample
@@ -179,7 +182,7 @@ def _box_loss(outputs, targets, anchors, num_positives, loss_type: str):
             xc_2 = torch.max(decoded_target[:, 3], decoded_output[:, 3])
             Ac = (xc_2 - xc_1) * (yc_2 - yc_1)
 
-            penalty = (Ac - U)/Ac
+            penalty = (Ac - U)/(Ac + eps)
         elif loss_type == 'diou':
             # central distance
             xc_target = (decoded_target[:, 3] + decoded_target[:, 1])/2
@@ -195,7 +198,7 @@ def _box_loss(outputs, targets, anchors, num_positives, loss_type: str):
             xc_2 = torch.max(decoded_target[:, 3], decoded_output[:, 3])
             c2 = (xc_2 - xc_1)**2 + (yc_2 - yc_1)**2
 
-            penalty = p2/c2
+            penalty = p2/(c2 + eps)
         else:
             raise AssertionError('no valid iou loss')
 
