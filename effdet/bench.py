@@ -151,7 +151,7 @@ class DetBenchTrain(nn.Module):
                 self.num_classes,
                 match_threshold=0.5,
             )
-        self.loss_fn = DetectionLoss(model.config)
+        self.loss_fn = DetectionLoss(model.config, self.anchors._generate_boxes())
 
     def forward(self, x, target: Dict[str, torch.Tensor]):
         class_out, box_out = self.model(x)
