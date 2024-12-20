@@ -11,6 +11,8 @@ import torch.nn.functional as F
 
 from typing import Optional, List, Tuple
 
+from effdet.anchors import decode_box_outputs
+
 
 def focal_loss_legacy(logits, targets, alpha: float, gamma: float, normalizer):
     """Compute the focal loss between `logits` and the golden `target` values.
@@ -124,15 +126,83 @@ def smooth_l1_loss(
         return loss.sum()
 
 
-def _box_loss(box_outputs, box_targets, num_positives, delta: float = 0.1):
+def _iou(decoded_output, decoded_target):
+    # area of gt
+    Ag = (decoded_target[:, 3] - decoded_target[:, 1]) * (decoded_target[:, 2] - decoded_target[:, 0])
+
+    # area of pred
+    Ap = (decoded_output[:, 3] - decoded_output[:, 1]) * (decoded_output[:, 2] - decoded_output[:, 0])
+
+    # intersection
+    yI_1 = torch.max(decoded_target[:, 0], decoded_output[:, 0])
+    xI_1 = torch.max(decoded_target[:, 1], decoded_output[:, 1])
+    yI_2 = torch.min(decoded_target[:, 2], decoded_output[:, 2])
+    xI_2 = torch.min(decoded_target[:, 3], decoded_output[:, 3])
+    I = (xI_2 - xI_1) * (yI_2 - yI_1)
+    I_cond = torch.logical_and(xI_2 > xI_1, yI_2 > yI_1)
+    I = torch.where(I_cond, I, 0.0)
+
+    # union
+    U = Ap + Ag - I
+
+    return I/U, U
+
+
+def _box_loss(outputs, targets, anchors, num_positives, loss_type: str):
     """Computes box regression loss."""
     # delta is typically around the mean value of regression target.
     # for instances, the regression targets of 512x512 input with 6 anchors on
     # P3-P7 pyramid is about [0.1, 0.1, 0.2, 0.2].
-    normalizer = num_positives * 4.0
-    mask = box_targets != 0.0
-    box_loss = huber_loss(box_outputs, box_targets, weights=mask, delta=delta, size_average=False)
-    return box_loss / normalizer
+
+    loss = []
+    anchors = anchors.to(targets.device)
+    for output, target in zip(outputs, targets): # per sample
+        mask = torch.all(target != 0.0, dim=1)
+        rel_anchors = anchors[mask, :].reshape([-1, 4])
+
+        target = target[mask, :].reshape([-1, 4])
+        decoded_target = decode_box_outputs(target, rel_anchors) # yxyx
+
+        output = output[mask, :].reshape([-1, 4])
+        decoded_output = decode_box_outputs(output, rel_anchors) # yxyx
+
+        iou, U = _iou(decoded_output, decoded_target)
+
+        penalty = 0.
+        if loss_type == 'iou':
+            continue
+        if loss_type == 'giou':
+            # calculate Ac
+            yc_1 = torch.min(decoded_target[:, 0], decoded_output[:, 0])
+            xc_1 = torch.min(decoded_target[:, 1], decoded_output[:, 1])
+            yc_2 = torch.max(decoded_target[:, 2], decoded_output[:, 2])
+            xc_2 = torch.max(decoded_target[:, 3], decoded_output[:, 3])
+            Ac = (xc_2 - xc_1) * (yc_2 - yc_1)
+
+            penalty = (Ac - U)/Ac
+        elif loss_type == 'diou':
+            # central distance
+            xc_target = (decoded_target[:, 3] + decoded_target[:, 1])/2
+            yc_target = (decoded_target[:, 2] + decoded_target[:, 0])/2
+            xc_output = (decoded_output[:, 3] + decoded_output[:, 1])/2
+            yc_output = (decoded_output[:, 2] + decoded_output[:, 0])/2
+            p2 = (yc_target - yc_output)**2 + (xc_target - xc_output)**2
+
+            # diagonal of smallest enclosing box
+            yc_1 = torch.min(decoded_target[:, 0], decoded_output[:, 0])
+            xc_1 = torch.min(decoded_target[:, 1], decoded_output[:, 1])
+            yc_2 = torch.max(decoded_target[:, 2], decoded_output[:, 2])
+            xc_2 = torch.max(decoded_target[:, 3], decoded_output[:, 3])
+            c2 = (xc_2 - xc_1)**2 + (yc_2 - yc_1)**2
+
+            penalty = p2/c2
+        else:
+            raise AssertionError('no valid iou loss')
+
+        loss.append(1. - iou + penalty)
+
+    loss = torch.cat(loss)
+    return loss.mean()/num_positives
 
 
 def one_hot(x, num_classes: int):
@@ -148,11 +218,13 @@ def loss_fn(
         cls_targets: List[torch.Tensor],
         box_targets: List[torch.Tensor],
         num_positives: torch.Tensor,
+        box_loss_type: str,
         num_classes: int,
         alpha: float,
         gamma: float,
         delta: float,
         box_loss_weight: float,
+        anchors: torch.Tensor,
         label_smoothing: float = 0.,
         legacy_focal: bool = False,
         ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -207,15 +279,14 @@ def loss_fn(
         cls_loss = cls_loss * (cls_targets_at_level != -2).unsqueeze(-1)
         cls_losses.append(cls_loss.sum())   # FIXME reference code added a clamp here at some point ...clamp(0, 2))
 
-        box_losses.append(_box_loss(
-            box_outputs[l].permute(0, 2, 3, 1).float(),
-            box_targets_at_level,
-            num_positives_sum,
-            delta=delta))
+    batch_size = box_outputs[0].shape[0]
+    _box_outputs = torch.concat([z.permute(0, 2, 3, 1).reshape([batch_size, -1, 4]) for z in box_outputs], dim=1)
+    _box_targets = torch.concat([z.reshape([batch_size, -1, 4]) for z in box_targets], dim=1)
+    box_loss = _box_loss(_box_outputs, _box_targets, anchors, num_positives_sum, loss_type=box_loss_type)
 
     # Sum per level losses to total loss.
     cls_loss = torch.sum(torch.stack(cls_losses, dim=-1), dim=-1)
-    box_loss = torch.sum(torch.stack(box_losses, dim=-1), dim=-1)
+    # box_loss = torch.sum(torch.stack(box_losses, dim=-1), dim=-1)
     total_loss = cls_loss + box_loss_weight * box_loss
     return total_loss, cls_loss, box_loss
 
@@ -227,7 +298,7 @@ class DetectionLoss(nn.Module):
 
     __constants__ = ['num_classes']
 
-    def __init__(self, config):
+    def __init__(self, config, anchors):
         super(DetectionLoss, self).__init__()
         self.config = config
         self.num_classes = config.num_classes
@@ -238,6 +309,7 @@ class DetectionLoss(nn.Module):
         self.label_smoothing = config.label_smoothing
         self.legacy_focal = config.legacy_focal
         self.use_jit = config.jit_loss
+        self.anchors = anchors
 
     def forward(
             self,
@@ -254,6 +326,6 @@ class DetectionLoss(nn.Module):
             l_fn = loss_jit
 
         return l_fn(
-            cls_outputs, box_outputs, cls_targets, box_targets, num_positives,
+            cls_outputs, box_outputs, cls_targets, box_targets, num_positives, box_loss_type=self.config.box_loss_type,
             num_classes=self.num_classes, alpha=self.alpha, gamma=self.gamma, delta=self.delta,
-            box_loss_weight=self.box_loss_weight, label_smoothing=self.label_smoothing, legacy_focal=self.legacy_focal)
+            box_loss_weight=self.box_loss_weight, label_smoothing=self.label_smoothing, legacy_focal=self.legacy_focal, anchors=self.anchors)
