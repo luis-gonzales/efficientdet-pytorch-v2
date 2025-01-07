@@ -479,7 +479,7 @@ def main():
                 metricd = OrderedDict(epoch=epoch)
                 metricd.update([('train_' + k, v) for k, v in train_metrics.items()])
                 metricd.update([('eval_' + k, v) for k, v in eval_metrics.items()])
-                wandb.log(metricd)
+                wandb.log(metricd, step=epoch)
 
             if lr_scheduler is not None:
                 # step LR for next epoch
