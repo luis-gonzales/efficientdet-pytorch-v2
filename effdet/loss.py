@@ -159,7 +159,7 @@ def _box_loss(outputs, targets, anchors, num_positives, loss_type: str):
     eps = 1e-7
     loss = []
     anchors = anchors.to(targets.device)
-    for output, target in zip(outputs, targets): # per sample
+    for output, target in zip(outputs, targets): # batch-level
         mask = torch.all(target != 0.0, dim=1)
         rel_anchors = anchors[mask, :].reshape([-1, 4])
 
@@ -199,6 +199,29 @@ def _box_loss(outputs, targets, anchors, num_positives, loss_type: str):
             c2 = (xc_2 - xc_1)**2 + (yc_2 - yc_1)**2
 
             penalty = p2/(c2 + eps)
+        elif loss_type == 'eiou':
+            # central distance
+            xc_target = (decoded_target[:, 3] + decoded_target[:, 1])/2
+            yc_target = (decoded_target[:, 2] + decoded_target[:, 0])/2
+            xc_output = (decoded_output[:, 3] + decoded_output[:, 1])/2
+            yc_output = (decoded_output[:, 2] + decoded_output[:, 0])/2
+            p2 = (yc_target - yc_output)**2 + (xc_target - xc_output)**2
+
+            # enclosing box C
+            yc_1 = torch.min(decoded_target[:, 0], decoded_output[:, 0])
+            xc_1 = torch.min(decoded_target[:, 1], decoded_output[:, 1])
+            yc_2 = torch.max(decoded_target[:, 2], decoded_output[:, 2])
+            xc_2 = torch.max(decoded_target[:, 3], decoded_output[:, 3])
+            wc = xc_2 - xc_1
+            hc = yc_2 - yc_1
+
+            # aspect ratio
+            w_gt = decoded_target[:, 3] - decoded_target[:, 1]
+            h_gt = decoded_target[:, 2] - decoded_target[:, 0]
+            w_pred = decoded_output[:, 3] - decoded_output[:, 1]
+            h_pred = decoded_output[:, 2] - decoded_output[:, 0]
+
+            penalty = p2 / (wc**2 + hc**2 + eps) + (w_gt - w_pred)**2 / (wc**2 + eps) + (h_gt - h_pred)**2 / (hc**2 + eps)
         else:
             raise AssertionError('no valid iou loss')
 
