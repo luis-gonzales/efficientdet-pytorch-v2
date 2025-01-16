@@ -228,7 +228,7 @@ def _box_loss(outputs, targets, anchors, num_positives, loss_type: str):
         loss.append(1. - iou + penalty)
 
     loss = torch.cat(loss)
-    return loss.mean()/num_positives
+    return loss.mean()
 
 
 def one_hot(x, num_classes: int):
