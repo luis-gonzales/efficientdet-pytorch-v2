@@ -67,7 +67,7 @@ def default_detection_model_configs():
 
     # localization loss (used by train bench)
     h.delta = 0.1
-    h.box_loss_weight = 1200.
+    h.box_loss_weight = 2.0
     h.box_loss_type = 'diou'
 
     # nms
