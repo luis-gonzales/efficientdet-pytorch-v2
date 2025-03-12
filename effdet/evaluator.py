@@ -119,15 +119,39 @@ class CocoEvaluator(Evaluator):
             coco_eval.evaluate()
             coco_eval.accumulate()
             coco_eval.summarize()
-            metric = coco_eval.stats[0]  # mAP 0.5-0.95
+            map_ = coco_eval.stats[0]  # mAP 0.5-0.95
+            map_s = coco_eval.stats[3]
+            map_m = coco_eval.stats[4]
+            map_l = coco_eval.stats[5]
+            mar_ = coco_eval.stats[8]
             if self.distributed:
-                dist.broadcast(torch.tensor(metric, device=self.distributed_device), 0)
+                dist.broadcast(torch.tensor(map_, device=self.distributed_device), 0)
+                dist.broadcast(torch.tensor(map_s, device=self.distributed_device), 0)
+                dist.broadcast(torch.tensor(map_m, device=self.distributed_device), 0)
+                dist.broadcast(torch.tensor(map_l, device=self.distributed_device), 0)
+                dist.broadcast(torch.tensor(mar_, device=self.distributed_device), 0)
         else:
-            metric = torch.tensor(0, device=self.distributed_device)
-            dist.broadcast(metric, 0)
-            metric = metric.item()
+            map_ = torch.tensor(0, device=self.distributed_device)
+            dist.broadcast(map_, 0)
+            map_ = map_.item()
+
+            map_s = torch.tensor(0, device=self.distributed_device)
+            dist.broadcast(map_s, 0)
+            map_s = map_s.item()
+
+            map_m = torch.tensor(0, device=self.distributed_device)
+            dist.broadcast(map_m, 0)
+            map_m = map_m.item()
+
+            map_l = torch.tensor(0, device=self.distributed_device)
+            dist.broadcast(map_l, 0)
+            map_l = map_l.item()
+
+            mar_ = torch.tensor(0, device=self.distributed_device)
+            dist.broadcast(mar_, 0)
+            mar_ = mar_.item()
         self.reset()
-        return metric
+        return {'map': map_, 'map_s': map_s, 'map_m': map_m, 'map_l': map_l, 'mar': mar_}
 
 
 class TfmEvaluator(Evaluator):
