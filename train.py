@@ -478,7 +478,8 @@ def main():
             if args.local_rank == 0 and args.project:
                 metricd = OrderedDict(epoch=epoch)
                 metricd.update([('train_' + k, v) for k, v in train_metrics.items()])
-                metricd.update([('eval_' + k, v) for k, v in eval_metrics.items()])
+                metricd.update([('val_' + k, v) for k, v in eval_metrics.items()])
+                metricd.update({'lr': lr_scheduler._get_lr(epoch)[0]})
                 wandb.log(metricd, step=epoch)
 
             if lr_scheduler is not None:
@@ -744,7 +745,12 @@ def validate(model, loader, args, evaluator=None, log_suffix=''):
 
     metrics = OrderedDict([('loss', losses_m.avg), ('box_loss', box_losses_m.avg), ('cls_loss', cls_losses_m.avg)])
     if evaluator is not None:
-        metrics['map'] = evaluator.evaluate()
+        coco_stats = evaluator.evaluate()
+        metrics['map'] = coco_stats['map']
+        metrics['map_s'] = coco_stats['map_s']
+        metrics['map_m'] = coco_stats['map_m']
+        metrics['map_l'] = coco_stats['map_l']
+        metrics['mar'] = coco_stats['mar']
 
     return metrics
 
